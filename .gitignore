@@ -5,11 +5,11 @@ __pycache__/
 *.pyd
 
 # Virtual environment
+.env
+backend/.env
 venv/
-.env/
 
 # Environment variables
-.env
 
 # IDE files
 .vscode/
