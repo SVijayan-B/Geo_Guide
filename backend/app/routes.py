@@ -12,7 +12,7 @@ from app.schemas.user_schema import UserCreate, UserResponse
 from app.schemas.trip_schema import TripCreate, TripResponse
 
 from app.services.context_service import ContextService
-
+from app.services.recommendation_service import RecommendationService
 
 router = APIRouter()
 
@@ -46,3 +46,24 @@ def get_trip_context(trip_id: int, db: Session = Depends(get_db)):
     context = context_service.build_context(trip)
 
     return context
+
+
+@router.get("/recommend/{trip_id}")
+def recommend_places(trip_id: int, db: Session = Depends(get_db)):
+    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+
+    if not trip:
+        return {"error": "Trip not found"}
+
+    # Context
+    context_service = ContextService()
+    context = context_service.build_context(trip)
+
+    # Recommendation
+    recommendation_service = RecommendationService()
+    recommendations = recommendation_service.recommend(context)
+
+    return {
+        "context_text": context["text"],
+        "recommendations": recommendations
+    }

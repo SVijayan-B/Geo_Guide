@@ -1,33 +1,49 @@
 from datetime import datetime
+from sentence_transformers import SentenceTransformer
 
 
 class ContextService:
 
-    def get_time_of_day(self):
-        current_hour = datetime.now().hour
+    def __init__(self):
+        # Pretrained embedding model
+        self.model = SentenceTransformer('all-MiniLM-L6-v2')
 
-        if 5 <= current_hour < 12:
+    def get_time_of_day(self):
+        hour = datetime.now().hour
+
+        if 5 <= hour < 12:
             return "morning"
-        elif 12 <= current_hour < 17:
+        elif 12 <= hour < 17:
             return "afternoon"
-        elif 17 <= current_hour < 21:
+        elif 17 <= hour < 21:
             return "evening"
         else:
             return "night"
 
-    def get_travel_phase(self, trip_status: str):
-        if trip_status == "planned":
+    def get_travel_phase(self, status):
+        if status == "planned":
             return "pre_departure"
-        elif trip_status == "ongoing":
+        elif status == "ongoing":
             return "in_transit"
-        elif trip_status == "completed":
-            return "post_trip"
         return "unknown"
 
     def build_context(self, trip):
+        time_of_day = self.get_time_of_day()
+        phase = self.get_travel_phase(trip.status)
+
+        # Convert to natural language (VERY IMPORTANT)
+        context_text = f"""
+        User is traveling from {trip.origin} to {trip.destination}.
+        It is {time_of_day}.
+        Travel phase is {phase}.
+        """
+
+        # Generate embedding
+        embedding = self.model.encode(context_text).tolist()
+
         return {
-            "time_of_day": self.get_time_of_day(),
-            "travel_phase": self.get_travel_phase(trip.status),
-            "origin": trip.origin,
-            "destination": trip.destination
+            "text": context_text,
+            "embedding": embedding,
+            "time_of_day": time_of_day,
+            "travel_phase": phase
         }
