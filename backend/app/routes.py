@@ -14,6 +14,10 @@ from app.schemas.trip_schema import TripCreate, TripResponse
 from app.services.context_service import ContextService
 from app.services.recommendation_service import RecommendationService
 
+from app.agents.decision_agent import DecisionAgent
+from app.agents.notification_agent import NotificationAgent
+from app.agents.disruption_agent import DisruptionAgent
+
 router = APIRouter()
 
 
@@ -47,7 +51,6 @@ def get_trip_context(trip_id: int, db: Session = Depends(get_db)):
 
     return context
 
-
 @router.get("/recommend/{trip_id}")
 def recommend_places(trip_id: int, db: Session = Depends(get_db)):
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
@@ -55,15 +58,32 @@ def recommend_places(trip_id: int, db: Session = Depends(get_db)):
     if not trip:
         return {"error": "Trip not found"}
 
-    # Context
+    # 🧠 Context
     context_service = ContextService()
     context = context_service.build_context(trip)
 
-    # Recommendation
+    # ⚠️ Disruption (NEW)
+    disruption_agent = DisruptionAgent()
+    disruption = disruption_agent.predict_delay(trip, context)
+
+    # 📊 Recommendations
     recommendation_service = RecommendationService()
     recommendations = recommendation_service.recommend(context)
 
+    # 🤖 Decision (UPDATED)
+    decision_agent = DecisionAgent()
+    decision = decision_agent.make_decision(
+        context["text"],
+        recommendations,
+        disruption   # 🔥 NEW INPUT
+    )
+    # 📢 Notification
+    notification_agent = NotificationAgent()
+    message = notification_agent.format_message(context, decision)
+
     return {
-        "context_text": context["text"],
-        "recommendations": recommendations
+        "context": context["text"],
+        "recommendations": recommendations,
+        "decision": decision,
+        "message": message
     }
