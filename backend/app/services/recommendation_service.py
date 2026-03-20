@@ -10,27 +10,30 @@ class RecommendationService:
     def get_mock_places(self, location):
         return [
             {
-                "name": "Cafe Sunrise",
-                "description": "A calm place for breakfast and coffee"
+                "name": "Budget Cafe",
+                "description": "cheap food and snacks",
+                "avg_price": 150
             },
             {
-                "name": "City Mall",
-                "description": "Shopping and entertainment hub"
+                "name": "Luxury Dine",
+                "description": "premium dining experience",
+                "avg_price": 1200
             },
             {
-                "name": "Green Park",
-                "description": "Relaxing park with nature and fresh air"
+                "name": "Street Food Hub",
+                "description": "local street food and quick meals",
+                "avg_price": 100
             },
             {
-                "name": "Night Bar",
-                "description": "Great nightlife and drinks"
+                "name": "Mall Food Court",
+                "description": "variety of food options",
+                "avg_price": 300
             }
         ]
 
-    def recommend(self, context):
+    def recommend(self, context, target_price=None):
         places = self.get_mock_places(context["text"])
 
-        # Context embedding
         context_vector = context["embedding"]
 
         results = []
@@ -43,9 +46,19 @@ class RecommendationService:
                 [place_vector]
             )[0][0]
 
+            # 💰 PRICE SCORE (NEW 🔥)
+            price_score = 1
+
+            if target_price:
+                diff = abs(place["avg_price"] - target_price)
+                price_score = 1 / (1 + diff)
+
+            final_score = similarity * 0.7 + price_score * 0.3
+
             results.append({
                 "name": place["name"],
-                "score": float(similarity)
+                "score": float(final_score),
+                "price": place["avg_price"]
             })
 
         results.sort(key=lambda x: x["score"], reverse=True)

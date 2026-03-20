@@ -17,8 +17,15 @@ class DisruptionAgent:
         self.model = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
 
     def predict_delay(self, trip, context):
+
+        # 🔥 HANDLE BOTH dict + object
+        if isinstance(trip, dict):
+            origin = trip.get("origin")
+        else:
+            origin = trip.origin
+
         # 🌦️ Real weather
-        weather = self.weather_api.get_weather(trip.origin)
+        weather = self.weather_api.get_weather(origin)
 
         prompt = f"""
         You are an AI system predicting flight delays.
@@ -51,7 +58,7 @@ class DisruptionAgent:
 
         raw_output = response.choices[0].message.content.strip()
 
-        # 🔥 Parse JSON safely
+        # 🔥 Safe JSON parsing
         import json
         try:
             parsed = json.loads(raw_output)
@@ -59,7 +66,6 @@ class DisruptionAgent:
             cleaned = raw_output.replace("```json", "").replace("```", "").strip()
             parsed = json.loads(cleaned)
 
-        # Add raw weather for transparency
         parsed["weather"] = weather
 
         return parsed

@@ -28,17 +28,25 @@ class ContextService:
         return "unknown"
 
     def build_context(self, trip):
-        time_of_day = self.get_time_of_day()
-        phase = self.get_travel_phase(trip.status)
+    # 🔥 HANDLE BOTH dict + object
+        if isinstance(trip, dict):
+            origin = trip.get("origin")
+            destination = trip.get("destination")
+            status = trip.get("status")
+        else:
+            origin = trip.origin
+            destination = trip.destination
+            status = trip.status
 
-        # Convert to natural language (VERY IMPORTANT)
+        time_of_day = self.get_time_of_day()
+        phase = self.get_travel_phase(status)
+
         context_text = f"""
-        User is traveling from {trip.origin} to {trip.destination}.
+        User is traveling from {origin} to {destination}.
         It is {time_of_day}.
         Travel phase is {phase}.
         """
 
-        # Generate embedding
         embedding = self.model.encode(context_text).tolist()
 
         return {
