@@ -3,3 +3,8 @@ uvicorn
 python-dotenv
 sqlalchemy
 psycopg2-binary
+python-jose[cryptography]
+bcrypt
+chromadb
+sentence-transformers
+scikit-learn

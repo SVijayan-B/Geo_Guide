@@ -3,10 +3,10 @@ from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.auth.auth_service import create_access_token, decode_token
-from fastapi import Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import bcrypt
 
-from app.models.user import User
+from app.models.user import User, UserCredential
 from app.models.trip import Trip
 
 from app.schemas.user_schema import UserCreate, UserResponse
@@ -17,6 +17,9 @@ from app.services.recommendation_service import RecommendationService
 from app.services.currency_service import CurrencyService
 from app.services.routing_service import RoutingService
 from app.services.cache_service import CacheService
+from app.services.chat_memory_service import ChatMemoryService
+from app.services.vector_memory_service import VectorMemoryService
+from app.services.image_pipeline_service import ImagePipelineService
 
 from app.agents.chatbot_agent import ChatbotAgent
 from app.agents.vision_agent import VisionAgent
@@ -24,6 +27,7 @@ from app.agents.vision_classifier import VisionClassifier
 from app.agents.place_agent import PlaceAgent
 from app.agents.price_agent import PriceAgent
 from app.agents.deal_agent import DealAgent
+from app.agents.disruption_agent import DisruptionAgent
 
 from app.graph.agent_graph import build_graph
 
@@ -33,8 +37,6 @@ import asyncio
 
 router = APIRouter()
 security = HTTPBearer()
-SECRET_KEY = "supersecret"
-ALGORITHM = "HS256"
 
 
 # ------------------------
@@ -70,14 +72,40 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_user)
 
+    # If a password is provided, store a bcrypt hash in a dedicated credentials table.
+    # This keeps the existing `users` schema compatible with earlier deployments.
+    if user.password:
+        password_hash = bcrypt.hashpw(user.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        cred = UserCredential(user_id=new_user.id, password_hash=password_hash)
+        db.add(cred)
+        db.commit()
+
     return new_user
 
 @router.post("/login")
-def login(email: str, db: Session = Depends(get_db)):
+def login(email: str, password: str | None = None, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == email).first()
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    credential = db.query(UserCredential).filter(UserCredential.user_id == user.id).first()
+
+    # Secure path: password is provided and we verify against stored bcrypt hash.
+    if password is not None:
+        if not credential:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        ok = bcrypt.checkpw(password.encode("utf-8"), credential.password_hash.encode("utf-8"))
+        if not ok:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Backward-compatible legacy path:
+    # - If no password is supplied and no credential exists (older accounts), allow token issuance.
+    # - If a credential exists but password is missing, require password (prevents insecure logins).
+    else:
+        if credential:
+            raise HTTPException(status_code=401, detail="Password required")
 
     token = create_access_token({
         "user_id": str(user.id)
@@ -156,9 +184,16 @@ async def recommend_places(
 
     graph = build_graph()
 
-    # 🔥 FIX: pass full object (no dict issues)
     result = graph.invoke({
-        "trip": trip
+        # Keep `trip` JSON-serializable for API responses.
+        "trip": {
+            "id": str(trip.id),
+            "user_id": str(trip.user_id),
+            "origin": trip.origin,
+            "destination": trip.destination,
+            "status": trip.status,
+        },
+        "user_id": user_id,
     })
 
     return result
@@ -172,117 +207,116 @@ async def chat_with_ai(
     query: str = None,
     image_path: str = None,
     city: str = "Chennai",
-    user_id: str = Depends(get_current_user)
+    home_currency: str = Header(default="INR", alias="X-Home-Currency"),
+    destination_currency: str | None = None,
+    chat_session_id: int | None = None,
+    new_chat: bool = False,
+    title: str | None = None,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     chatbot = ChatbotAgent()
     cache = CacheService()
+    chat_memory = ChatMemoryService()
+    vector_memory = VectorMemoryService()
+
+    if query is None and image_path is None:
+        raise HTTPException(status_code=400, detail="Provide `query` or `image_path`.")
+
+    user_id_int = int(user_id)
+    session = None
+    if new_chat or chat_session_id is not None:
+        # Fetch existing or create new based on `new_chat`
+        if new_chat:
+            session = chat_memory.create_session(db, user_id=user_id_int, title=title or "New chat")
+        else:
+            try:
+                session = chat_memory.get_or_create_session(
+                    db, user_id=user_id_int, chat_session_id=chat_session_id
+                )
+            except ValueError:
+                raise HTTPException(status_code=404, detail="Chat session not found")
 
     # 🖼️ IMAGE FLOW
     if image_path:
-        cache_key = f"image:{image_path}"
-        cached = cache.get(cache_key)
-
-        if cached:
-            return cached
-
-        vision = VisionAgent()
-        classifier = VisionClassifier()
-        place_agent = PlaceAgent()
-        price_agent = PriceAgent()
-        deal_agent = DealAgent()
-        currency = CurrencyService()
-        recommendation_service = RecommendationService()
-        routing_service = RoutingService()
-
-        vision_output = vision.analyze_image(image_path)
-        category = classifier.classify(vision_output)
-
-        # 🏛️ PLACE
-        if category == "place":
-            explanation = place_agent.explain_place(
-                vision_output["description"]
+        # If session wasn't created for this request yet, create one (we don't change response shape).
+        if session is None:
+            session = chat_memory.get_or_create_session(
+                db,
+                user_id=user_id_int,
+                chat_session_id=chat_session_id,
+                title=title or f"Image chat: {city}",
             )
 
-            response_data = {
-                "type": "place",
-                "vision": vision_output,
-                "explanation": explanation
-            }
-
-            cache.set(cache_key, response_data)
-            return response_data
-
-        # 🛒 OBJECT
-        price_info = price_agent.estimate_price(
-            vision_output["description"]
+        cache_key = f"image:{image_path}"
+        image_service = ImagePipelineService()
+        return await image_service.process_image(
+            image_path=image_path,
+            city=city,
+            home_currency=home_currency,
+            destination_currency=destination_currency,
+            user_id_int=user_id_int,
+            session=session,
+            db=db,
+            cache=cache,
+            cache_key=cache_key,
+            chat_memory=chat_memory,
+            vector_memory=vector_memory,
         )
-
-        target_price = price_info["estimated_price"]
-
-        converted_price = currency.convert(
-            amount=target_price,
-            from_currency="INR",
-            to_currency="USD"
-        )
-
-        context = {
-            "text": f"Looking for {price_info['product']} in {city}",
-            "embedding": [0] * 384
-        }
-
-        recommendations = recommendation_service.recommend(
-            context,
-            target_price=target_price
-        )
-
-        deals = deal_agent.find_best_deals(
-            city,
-            price_info["product"],
-            target_price
-        )
-
-        # 🗺️ ASYNC ROUTING
-        tasks = [
-            routing_service.get_route(city, deal["place"])
-            for deal in deals[:3]
-        ]
-
-        route_results = await asyncio.gather(
-            *tasks,
-            return_exceptions=True
-        )
-
-        routes = []
-
-        for deal, route in zip(deals[:3], route_results):
-            if isinstance(route, Exception):
-                continue
-
-            routes.append({
-                "to": deal["place"],
-                "route": route
-            })
-
-        response_data = {
-            "type": "object",
-            "detected": vision_output,
-            "product": price_info["product"],
-            "price": {
-                "estimated_local": f"{target_price} INR",
-                "converted": f"{converted_price} USD"
-            },
-            "best_places": recommendations[:3],
-            "cheaper_options": deals,
-            "routes": routes
-        }
-
-        cache.set(cache_key, response_data)
-        return response_data
 
     # 💬 NORMAL CHAT
-    response = chatbot.chat(
-        user_id=user_id,
-        query=query
+    # 💬 NORMAL CHAT
+    if session is None:
+        session = chat_memory.get_or_create_session(
+            db, user_id=user_id_int, chat_session_id=chat_session_id, title=title or "Chat"
+        )
+
+    # Store user message
+    chat_memory.append_message(db, session_id=session.id, role="user", content=query)
+    vector_memory.add_text(
+        user_id=user_id_int,
+        session_id=session.id,
+        role="user",
+        text=query,
     )
 
-    return {"response": response}
+    latest_trip = (
+        db.query(Trip)
+        .filter(Trip.user_id == user_id_int)
+        .order_by(Trip.id.desc())
+        .first()
+    )
+
+    context = None
+    recommendations = None
+    disruption = None
+
+    if latest_trip is not None:
+        context_service = ContextService()
+        context = context_service.build_context(latest_trip)
+        recommendations = RecommendationService().recommend(context)
+        disruption = DisruptionAgent().predict_delay(latest_trip, context)
+
+    response = chatbot.chat(
+        user_id=user_id_int,
+        query=query,
+        context=context,
+        recommendations=recommendations,
+        disruption=disruption,
+        session_id=session.id,
+        db=db,
+    )
+
+    vector_memory.add_text(
+        user_id=user_id_int,
+        session_id=session.id,
+        role="assistant",
+        text=response,
+    )
+
+    return {
+        "chat_data": {"response": response},
+        "map_data": {"routes": []},
+        "response": response,
+        "chat_session_id": session.id,
+    }

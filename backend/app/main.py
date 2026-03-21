@@ -4,7 +4,7 @@ from app.config import APP_NAME
 from app.db.database import engine, Base
 
 # Import models (IMPORTANT)
-from app.models import user, trip
+from app.models import user, trip, chat
 
 # Create tables
 Base.metadata.create_all(bind=engine)
