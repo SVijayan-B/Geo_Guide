@@ -1,23 +1,33 @@
-# Python
+# --- Backend (FastAPI/Python) ---
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Virtual environment
-.env
-backend/.env
+*.py[cod]
+*$py.class
+.venv/
 venv/
+ENV/
+env/
+.env
+.env.example
+.pytest_cache/
+.mypy_cache/
+*.db
+*.log
+chroma_db/
+alembic.ini
 
-# Environment variables
+# --- Frontend (React Vite/Node) ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+.eslintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env.example
 
-# IDE files
+# --- IDE & OS ---
 .vscode/
 .idea/
-
-# OS files
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log

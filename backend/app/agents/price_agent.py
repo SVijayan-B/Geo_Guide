@@ -1,144 +1,216 @@
+﻿from __future__ import annotations
+
 import os
 import re
-from groq import Groq
+from typing import Any
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
 class PriceAgent:
-    """
-    Estimate a realistic price for an item described by an image caption.
+    """Hybrid price estimator with rule-based first-pass and optional LLM fallback."""
 
-    Cost optimization:
-    - If the description contains an explicit price, we skip Groq entirely.
-    - Otherwise, we use Groq once to get both product + price range + currency.
-    """
+    PRODUCT_HINTS = {
+        "coffee": (120, 350, "INR"),
+        "tea": (40, 180, "INR"),
+        "pizza": (250, 900, "INR"),
+        "burger": (120, 500, "INR"),
+        "headphone": (800, 4500, "INR"),
+        "phone": (8000, 65000, "INR"),
+        "shoes": (1200, 8500, "INR"),
+        "bag": (700, 5000, "INR"),
+        "watch": (1000, 12000, "INR"),
+        "jacket": (900, 6000, "INR"),
+        "book": (150, 900, "INR"),
+    }
+
+    CITY_FACTOR = {
+        "mumbai": 1.15,
+        "delhi": 1.1,
+        "bangalore": 1.2,
+        "new york": 4.5,
+        "london": 4.0,
+        "dubai": 3.3,
+        "singapore": 3.8,
+    }
 
     def __init__(self):
-        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
         self.model = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
+        self.use_groq = os.getenv("USE_GROQ_PRICE_AGENT", "0").strip().lower() in {"1", "true", "yes", "on"}
+        self.client = None
+
+        if self.use_groq:
+            api_key = os.getenv("GROQ_API_KEY")
+            if api_key:
+                try:
+                    from groq import Groq
+
+                    self.client = Groq(api_key=api_key)
+                except Exception:
+                    self.client = None
 
     def _symbol_to_currency(self, symbol: str) -> str | None:
-        return {"₹": "INR", "$": "USD", "€": "EUR", "£": "GBP"}.get(symbol)
+        return {
+            "$": "USD",
+            "EUR": "EUR",
+            "GBP": "GBP",
+            "INR": "INR",
+            "\u20b9": "INR",
+            "\u20ac": "EUR",
+            "\u00a3": "GBP",
+        }.get(symbol)
 
-    def _heuristic_product(self, description: str) -> str:
-        cleaned = description or ""
-        cleaned = re.sub(r"[₹$€£]\s*[0-9]+(?:[.,][0-9]+)?", "", cleaned)
-        cleaned = re.sub(r"\b(INR|USD|EUR|GBP|AED|SGD)\b", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\d+", "", cleaned)
-        cleaned = re.sub(r"[^a-zA-Z0-9\s-]", " ", cleaned)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        if not cleaned:
-            return "item"
-        return " ".join(cleaned.split()[:8])
-
-    def _extract_explicit_price(self, description: str) -> dict | None:
+    def _extract_explicit_price(self, description: str) -> dict[str, Any] | None:
         if not description:
             return None
 
-        # Symbol-based: "$ 120", "₹500", "€ 29.99"
-        symbol_match = re.search(r"([₹$€£])\s*([0-9]+(?:[.,][0-9]+)?)", description)
+        symbol_match = re.search(r"([$\u20b9\u20ac\u00a3])\s*([0-9]+(?:[.,][0-9]+)?)", description)
         if symbol_match:
-            symbol = symbol_match.group(1)
-            amount_raw = symbol_match.group(2).replace(",", "")
-            try:
-                amount = float(amount_raw)
-            except Exception:
-                return None
-
+            symbol, raw_amount = symbol_match.groups()
             currency = self._symbol_to_currency(symbol)
             if not currency:
                 return None
-
-            product = self._heuristic_product(description)
+            amount = float(raw_amount.replace(",", ""))
             return {
-                "product": product,
-                "price_range": {"min_price": amount * 0.9, "max_price": amount * 1.1, "currency": currency},
-                "estimated_price": round(amount, 2),
+                "amount": amount,
+                "currency": currency,
+                "source": "explicit",
             }
 
-        # ISO code + number: "INR 500", "USD 6"
-        iso_match = re.search(
-            r"\b(INR|USD|EUR|GBP|AED|SGD)\b\s*([0-9]+(?:[.,][0-9]+)?)",
-            description,
-            flags=re.IGNORECASE,
-        )
+        iso_match = re.search(r"\b(INR|USD|EUR|GBP|AED|SGD)\b\s*([0-9]+(?:[.,][0-9]+)?)", description, re.IGNORECASE)
         if iso_match:
-            currency = iso_match.group(1).upper()
-            amount_raw = iso_match.group(2).replace(",", "")
-            try:
-                amount = float(amount_raw)
-            except Exception:
-                return None
-
-            product = self._heuristic_product(description)
+            currency, raw_amount = iso_match.groups()
+            amount = float(raw_amount.replace(",", ""))
             return {
-                "product": product,
-                "price_range": {"min_price": amount * 0.9, "max_price": amount * 1.1, "currency": currency},
-                "estimated_price": round(amount, 2),
+                "amount": amount,
+                "currency": currency.upper(),
+                "source": "explicit",
             }
 
         return None
 
-    def _estimate_with_llm(self, description: str, city: str | None) -> dict:
+    def _detect_product(self, description: str) -> str:
+        text = (description or "").lower()
+        for key in self.PRODUCT_HINTS.keys():
+            if key in text:
+                return key
+        words = re.sub(r"[^a-z0-9\s-]", " ", text)
+        words = re.sub(r"\s+", " ", words).strip()
+        return " ".join(words.split()[:4]) or "item"
+
+    def _city_factor(self, city: str | None) -> float:
+        if not city:
+            return 1.0
+        return self.CITY_FACTOR.get(city.strip().lower(), 1.0)
+
+    def _heuristic_estimate(self, description: str, city: str | None) -> dict[str, Any]:
+        explicit = self._extract_explicit_price(description)
+        product = self._detect_product(description)
+
+        if explicit is not None:
+            amount = float(explicit["amount"])
+            return {
+                "product": product,
+                "price_range": {
+                    "min_price": round(amount * 0.9, 2),
+                    "max_price": round(amount * 1.1, 2),
+                    "currency": explicit["currency"],
+                },
+                "estimated_price": round(amount, 2),
+                "source": "explicit",
+                "confidence": 0.95,
+            }
+
+        base = self.PRODUCT_HINTS.get(product)
+        if base is None:
+            return {
+                "product": product,
+                "price_range": {
+                    "min_price": 200.0,
+                    "max_price": 2000.0,
+                    "currency": "INR",
+                },
+                "estimated_price": 1100.0,
+                "source": "fallback",
+                "confidence": 0.35,
+            }
+
+        low, high, currency = base
+        factor = self._city_factor(city)
+        min_price = round(low * factor, 2)
+        max_price = round(high * factor, 2)
+        avg = round((min_price + max_price) / 2, 2)
+        return {
+            "product": product,
+            "price_range": {
+                "min_price": min_price,
+                "max_price": max_price,
+                "currency": currency,
+            },
+            "estimated_price": avg,
+            "source": "heuristic",
+            "confidence": 0.75,
+        }
+
+    def _llm_estimate(self, description: str, city: str | None) -> dict[str, Any] | None:
+        if self.client is None:
+            return None
+
         city_hint = f" in {city}" if city else ""
         prompt = f"""
-You are a pricing assistant.
+Estimate a practical market price for this described item{city_hint}.
+Description: {description}
 
-Given this description of an item from an image:
-{description}
-
-Estimate the typical market price range for the product{city_hint}.
-
-Return ONLY valid JSON with this schema:
-{{
-  "product": string,
-  "min_price": number,
-  "max_price": number,
-  "currency": string   // ISO 4217 currency code, e.g. "INR", "USD"
-}}
+Return strict JSON with keys:
+- product (string)
+- min_price (number)
+- max_price (number)
+- currency (ISO code)
 """
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.choices[0].message.content.strip()
-
-        import json
-
         try:
-            data = json.loads(raw)
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = (response.choices[0].message.content or "").strip()
+
+            import json
+
+            try:
+                data = json.loads(raw)
+            except Exception:
+                cleaned = raw.replace("```json", "").replace("```", "").strip()
+                data = json.loads(cleaned)
+
+            min_price = float(data.get("min_price"))
+            max_price = float(data.get("max_price"))
+            if min_price > max_price:
+                min_price, max_price = max_price, min_price
+
+            return {
+                "product": data.get("product") or self._detect_product(description),
+                "price_range": {
+                    "min_price": round(min_price, 2),
+                    "max_price": round(max_price, 2),
+                    "currency": (data.get("currency") or "INR").upper(),
+                },
+                "estimated_price": round((min_price + max_price) / 2, 2),
+                "source": "llm",
+                "confidence": 0.7,
+            }
         except Exception:
-            cleaned = raw.replace("```json", "").replace("```", "").strip()
-            data = json.loads(cleaned)
+            return None
 
-        min_price = float(data.get("min_price"))
-        max_price = float(data.get("max_price"))
-        if min_price > max_price:
-            min_price, max_price = max_price, min_price
+    def estimate_price(self, description: str, city: str | None = None) -> dict[str, Any]:
+        heuristic = self._heuristic_estimate(description, city)
 
-        return {
-            "product": data.get("product") or self._heuristic_product(description),
-            "min_price": min_price,
-            "max_price": max_price,
-            "currency": (data.get("currency") or "INR").upper(),
-        }
+        if heuristic.get("confidence", 0) >= 0.7:
+            return heuristic
 
-    def estimate_price(self, description: str, city: str | None = None) -> dict:
-        explicit = self._extract_explicit_price(description)
-        if explicit is not None:
-            return explicit
+        llm = self._llm_estimate(description, city)
+        if llm is not None:
+            return llm
 
-        price_range = self._estimate_with_llm(description, city=city)
-        avg_price = (price_range["min_price"] + price_range["max_price"]) / 2
-
-        return {
-            "product": price_range["product"],
-            "price_range": {
-                "min_price": price_range["min_price"],
-                "max_price": price_range["max_price"],
-                "currency": price_range["currency"],
-            },
-            "estimated_price": round(float(avg_price), 2),
-        }
+        return heuristic

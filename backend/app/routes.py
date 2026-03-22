@@ -1,322 +1,305 @@
-from fastapi import APIRouter, Depends, HTTPException, Header
+from __future__ import annotations
+
+from typing import Any
+
+import bcrypt
+from fastapi import APIRouter, Body, Depends, Header, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+from app.application.dto.travel import ChatRequestDTO
+from app.application.use_cases.auth_use_case import AuthUseCase
+from app.application.use_cases.chat_use_case import ChatUseCase
+from app.auth.auth_service import decode_token
 from app.db.database import get_db
-from app.auth.auth_service import create_access_token, decode_token
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import bcrypt
-
-from app.models.user import User, UserCredential
-from app.models.trip import Trip
-
-from app.schemas.user_schema import UserCreate, UserResponse
-from app.schemas.trip_schema import TripCreate, TripResponse
-
-from app.services.context_service import ContextService
-from app.services.recommendation_service import RecommendationService
-from app.services.currency_service import CurrencyService
-from app.services.routing_service import RoutingService
-from app.services.cache_service import CacheService
-from app.services.chat_memory_service import ChatMemoryService
-from app.services.vector_memory_service import VectorMemoryService
-from app.services.image_pipeline_service import ImagePipelineService
-
-from app.agents.chatbot_agent import ChatbotAgent
-from app.agents.vision_agent import VisionAgent
-from app.agents.vision_classifier import VisionClassifier
-from app.agents.place_agent import PlaceAgent
-from app.agents.price_agent import PriceAgent
-from app.agents.deal_agent import DealAgent
-from app.agents.disruption_agent import DisruptionAgent
-
 from app.graph.agent_graph import build_graph
-
-from jose import jwt
-import os
-import asyncio
+from app.models.chat import ChatMessage, ChatSession
+from app.models.trip import Trip
+from app.models.user import User, UserCredential
+from app.schemas.trip_schema import TripCreate, TripResponse
+from app.schemas.user_schema import LoginRequest, TokenResponse, UserCreate, UserResponse
+from app.services.chat_memory_service import ChatMemoryService
+from app.services.context_service import ContextService
+from app.services.vector_memory_service import VectorMemoryService
 
 router = APIRouter()
 security = HTTPBearer()
 
 
-# ------------------------
-# AUTH HELPER
-# ------------------------
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-):
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> int:
     try:
-        token = credentials.credentials  # 🔥 auto extracts Bearer token
-        payload = decode_token(token)
+        payload = decode_token(credentials.credentials, expected_type="access")
+        return int(payload["user_id"])
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid token") from exc
 
-        return payload["user_id"]
 
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-# ------------------------
-# HEALTH CHECK
-# ------------------------
 @router.get("/health")
 def health_check():
     return {"status": "ok"}
 
 
-# ------------------------
-# CREATE USER
-# ------------------------
 @router.post("/create-user", response_model=UserResponse)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    new_user = User(name=user.name, email=user.email)
+    existing = db.query(User).filter(User.email == user.email).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
 
+    new_user = User(name=user.name, email=user.email)
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
-    # If a password is provided, store a bcrypt hash in a dedicated credentials table.
-    # This keeps the existing `users` schema compatible with earlier deployments.
     if user.password:
         password_hash = bcrypt.hashpw(user.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-        cred = UserCredential(user_id=new_user.id, password_hash=password_hash)
-        db.add(cred)
+        db.add(UserCredential(user_id=new_user.id, password_hash=password_hash))
         db.commit()
 
     return new_user
 
-@router.post("/login")
-def login(email: str, password: str | None = None, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == email).first()
 
+@router.post("/login", response_model=TokenResponse)
+def login(
+    payload: LoginRequest | None = Body(default=None),
+    email: str | None = None,
+    password: str | None = None,
+    db: Session = Depends(get_db),
+):
+    # Backward compatibility: allow query-parameter auth while supporting JSON body.
+    resolved_email = payload.email if payload else email
+    resolved_password = payload.password if payload else password
+
+    if not resolved_email:
+        raise HTTPException(status_code=422, detail="Email is required")
+
+    user = db.query(User).filter(User.email == resolved_email).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
     credential = db.query(UserCredential).filter(UserCredential.user_id == user.id).first()
 
-    # Secure path: password is provided and we verify against stored bcrypt hash.
-    if password is not None:
+    if resolved_password is not None:
         if not credential:
             raise HTTPException(status_code=401, detail="Invalid credentials")
-
-        ok = bcrypt.checkpw(password.encode("utf-8"), credential.password_hash.encode("utf-8"))
+        ok = bcrypt.checkpw(resolved_password.encode("utf-8"), credential.password_hash.encode("utf-8"))
         if not ok:
             raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    # Backward-compatible legacy path:
-    # - If no password is supplied and no credential exists (older accounts), allow token issuance.
-    # - If a credential exists but password is missing, require password (prevents insecure logins).
     else:
+        # Legacy path is allowed only if user has no password record.
         if credential:
             raise HTTPException(status_code=401, detail="Password required")
 
-    token = create_access_token({
-        "user_id": str(user.id)
-    })
+    token_pair = AuthUseCase().login_tokens(db, user_id=int(user.id))
+    return token_pair
 
-    return {
-        "access_token": token,
-        "token_type": "bearer"
-    }
 
-# ------------------------
-# CREATE TRIP (SECURED 🔥)
-# ------------------------
 @router.post("/create-trip", response_model=TripResponse)
 def create_trip(
     trip: TripCreate,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user)
+    user_id: int = Depends(get_current_user),
 ):
-    new_trip = Trip(
-        user_id=user_id,  # 🔥 from token
-        origin=trip.origin,
-        destination=trip.destination
-    )
-
+    new_trip = Trip(user_id=user_id, origin=trip.origin, destination=trip.destination)
     db.add(new_trip)
     db.commit()
     db.refresh(new_trip)
+
+    VectorMemoryService().add_trip_snapshot(
+        user_id=user_id,
+        trip_id=int(new_trip.id),
+        origin=new_trip.origin,
+        destination=new_trip.destination,
+        status=new_trip.status,
+    )
 
     return {
         "id": str(new_trip.id),
         "user_id": str(new_trip.user_id),
         "origin": new_trip.origin,
         "destination": new_trip.destination,
-        "status": new_trip.status
+        "status": new_trip.status,
     }
 
 
-# ------------------------
-# GET CONTEXT (SECURED)
-# ------------------------
 @router.get("/trip-context/{trip_id}")
 def get_trip_context(
     trip_id: str,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user)
+    user_id: int = Depends(get_current_user),
 ):
-    trip = db.query(Trip).filter(
-        Trip.id == trip_id,
-        Trip.user_id == user_id
-    ).first()
-
+    trip = db.query(Trip).filter(Trip.id == trip_id, Trip.user_id == user_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
-
-    context_service = ContextService()
-    return context_service.build_context(trip)
+    return ContextService().build_context(trip)
 
 
-# ------------------------
-# MAIN AI PIPELINE (LangGraph)
-# ------------------------
 @router.get("/recommend/{trip_id}")
 async def recommend_places(
     trip_id: str,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user)
+    user_id: int = Depends(get_current_user),
 ):
-    trip = db.query(Trip).filter(
-        Trip.id == trip_id,
-        Trip.user_id == user_id
-    ).first()
-
+    trip = db.query(Trip).filter(Trip.id == trip_id, Trip.user_id == user_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
+    trip_payload = {
+        "id": int(trip.id),
+        "user_id": int(trip.user_id),
+        "origin": trip.origin,
+        "destination": trip.destination,
+        "status": trip.status,
+    }
+
     graph = build_graph()
+    result = graph.invoke(
+        {
+            "input": {
+                "trip": trip_payload,
+                "user_id": int(user_id),
+                "query": f"Plan travel for {trip.origin} to {trip.destination}",
+                "city": trip.destination,
+                "mode": "pre_trip_plan",
+                "days": 3,
+                "traveler_type": "foodie",
+            },
+            "context": {},
+            "memory": {},
+            "disruption": {},
+            "recommendation": {},
+            "decision": {},
+            "output": {},
+        }
+    )
 
-    result = graph.invoke({
-        # Keep `trip` JSON-serializable for API responses.
-        "trip": {
-            "id": str(trip.id),
-            "user_id": str(trip.user_id),
-            "origin": trip.origin,
-            "destination": trip.destination,
-            "status": trip.status,
-        },
-        "user_id": user_id,
-    })
-
-    return result
+    output = result.get("output", {})
+    return {
+        **result,
+        "chat_data": output.get("chat_data", {}),
+        "map_data": output.get("map_data", {"routes": []}),
+    }
 
 
-# ------------------------
-# CHAT + IMAGE (MULTIMODAL AI 🔥)
-# ------------------------
 @router.post("/chat")
 async def chat_with_ai(
-    query: str = None,
-    image_path: str = None,
+    query: str | None = None,
+    image_path: str | None = None,
     city: str = "Chennai",
     home_currency: str = Header(default="INR", alias="X-Home-Currency"),
     destination_currency: str | None = None,
     chat_session_id: int | None = None,
     new_chat: bool = False,
     title: str | None = None,
-    user_id: str = Depends(get_current_user),
+    mode: str = "pre_trip_plan",
+    days: int = 3,
+    traveler_type: str = "foodie",
+    budget: float | None = None,
+    user_lat: float | None = None,
+    user_lon: float | None = None,
+    cuisine: str | None = None,
+    is_user_at_airport: bool = False,
+    flight_delayed: bool = False,
+    trip_id: int | None = None,
+    user_id: int = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    chatbot = ChatbotAgent()
-    cache = CacheService()
-    chat_memory = ChatMemoryService()
-    vector_memory = VectorMemoryService()
-
-    if query is None and image_path is None:
-        raise HTTPException(status_code=400, detail="Provide `query` or `image_path`.")
-
-    user_id_int = int(user_id)
-    session = None
-    if new_chat or chat_session_id is not None:
-        # Fetch existing or create new based on `new_chat`
-        if new_chat:
-            session = chat_memory.create_session(db, user_id=user_id_int, title=title or "New chat")
-        else:
-            try:
-                session = chat_memory.get_or_create_session(
-                    db, user_id=user_id_int, chat_session_id=chat_session_id
-                )
-            except ValueError:
-                raise HTTPException(status_code=404, detail="Chat session not found")
-
-    # 🖼️ IMAGE FLOW
-    if image_path:
-        # If session wasn't created for this request yet, create one (we don't change response shape).
-        if session is None:
-            session = chat_memory.get_or_create_session(
-                db,
-                user_id=user_id_int,
-                chat_session_id=chat_session_id,
-                title=title or f"Image chat: {city}",
-            )
-
-        cache_key = f"image:{image_path}"
-        image_service = ImagePipelineService()
-        return await image_service.process_image(
-            image_path=image_path,
-            city=city,
-            home_currency=home_currency,
-            destination_currency=destination_currency,
-            user_id_int=user_id_int,
-            session=session,
-            db=db,
-            cache=cache,
-            cache_key=cache_key,
-            chat_memory=chat_memory,
-            vector_memory=vector_memory,
-        )
-
-    # 💬 NORMAL CHAT
-    # 💬 NORMAL CHAT
-    if session is None:
-        session = chat_memory.get_or_create_session(
-            db, user_id=user_id_int, chat_session_id=chat_session_id, title=title or "Chat"
-        )
-
-    # Store user message
-    chat_memory.append_message(db, session_id=session.id, role="user", content=query)
-    vector_memory.add_text(
-        user_id=user_id_int,
-        session_id=session.id,
-        role="user",
-        text=query,
+    request = ChatRequestDTO(
+        query=query,
+        image_path=image_path,
+        city=city,
+        destination_currency=destination_currency,
+        trip_id=trip_id,
+        chat_session_id=chat_session_id,
+        new_chat=new_chat,
+        title=title,
+        mode=mode,
+        days=days,
+        traveler_type=traveler_type,
+        budget=budget,
+        user_lat=user_lat,
+        user_lon=user_lon,
+        cuisine=cuisine,
+        is_user_at_airport=is_user_at_airport,
+        flight_delayed=flight_delayed,
     )
 
-    latest_trip = (
-        db.query(Trip)
-        .filter(Trip.user_id == user_id_int)
-        .order_by(Trip.id.desc())
+    try:
+        return await ChatUseCase().handle_chat(
+            db=db,
+            user_id=user_id,
+            request=request,
+            home_currency=home_currency,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/chat/sessions")
+def list_chat_sessions(
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user),
+):
+    sessions = (
+        db.query(ChatSession)
+        .filter(ChatSession.user_id == user_id)
+        .order_by(ChatSession.updated_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": session.id,
+            "title": session.title,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+        }
+        for session in sessions
+    ]
+
+
+@router.post("/chat/sessions")
+def create_chat_session(
+    title: str | None = None,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user),
+):
+    session = ChatMemoryService().create_session(db, user_id=user_id, title=title or "New chat")
+    return {
+        "id": session.id,
+        "title": session.title,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+    }
+
+
+@router.get("/chat/sessions/{session_id}/messages")
+def list_chat_messages(
+    session_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user),
+):
+    session = (
+        db.query(ChatSession)
+        .filter(ChatSession.id == int(session_id), ChatSession.user_id == int(user_id))
         .first()
     )
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found")
 
-    context = None
-    recommendations = None
-    disruption = None
-
-    if latest_trip is not None:
-        context_service = ContextService()
-        context = context_service.build_context(latest_trip)
-        recommendations = RecommendationService().recommend(context)
-        disruption = DisruptionAgent().predict_delay(latest_trip, context)
-
-    response = chatbot.chat(
-        user_id=user_id_int,
-        query=query,
-        context=context,
-        recommendations=recommendations,
-        disruption=disruption,
-        session_id=session.id,
-        db=db,
+    messages = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.session_id == int(session_id))
+        .order_by(ChatMessage.created_at.asc())
+        .limit(max(1, min(limit, 200)))
+        .all()
     )
 
-    vector_memory.add_text(
-        user_id=user_id_int,
-        session_id=session.id,
-        role="assistant",
-        text=response,
-    )
-
-    return {
-        "chat_data": {"response": response},
-        "map_data": {"routes": []},
-        "response": response,
-        "chat_session_id": session.id,
-    }
+    return [
+        {
+            "id": message.id,
+            "role": message.role,
+            "content": message.content,
+            "created_at": message.created_at,
+        }
+        for message in messages
+    ]

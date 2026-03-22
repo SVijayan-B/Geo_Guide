@@ -1,26 +1,33 @@
-import os
+from __future__ import annotations
+
 import json
-from groq import Groq
+import os
+
 from dotenv import load_dotenv
 
-# Load environment variables
 load_dotenv()
 
 
 class DecisionAgent:
-
     def __init__(self):
-        # Cost optimization: heuristics first, Groq only when enabled.
-        api_key = os.getenv("GROQ_API_KEY")
         self.use_groq = os.getenv("USE_GROQ_DECISION", "0") == "1"
-        self.client = Groq(api_key=api_key) if (self.use_groq and api_key) else None
-
-        # Optional: make model configurable
         self.model = os.getenv("LLM_MODEL", "llama-3.1-8b-instant")
+        self.client = None
+
+        if self.use_groq:
+            api_key = os.getenv("GROQ_API_KEY")
+            if api_key:
+                try:
+                    from groq import Groq
+
+                    self.client = Groq(api_key=api_key)
+                except Exception:
+                    self.client = None
 
     def _heuristic_decision(self, context, recommendations, disruption) -> dict:
-        delay_prob = float(disruption.get("delay_probability") or 0.0)
-        risk_level = disruption.get("risk_level") or "low"
+        _ = context
+        delay_prob = float((disruption or {}).get("delay_probability") or 0.0)
+        risk_level = (disruption or {}).get("risk_level") or "low"
         top_reco = None
         try:
             if recommendations and isinstance(recommendations, list):
@@ -55,65 +62,47 @@ class DecisionAgent:
             return heuristic
 
         prompt = f"""
-        You are an intelligent travel assistant.
+You are an intelligent travel assistant.
 
-        CONTEXT:
-        {context}
+CONTEXT:
+{context}
 
-        RECOMMENDATIONS:
-        {recommendations}
+RECOMMENDATIONS:
+{recommendations}
 
-        DISRUPTION ANALYSIS:
-        {disruption}
+DISRUPTION ANALYSIS:
+{disruption}
 
-        TASK:
-        1. If delay_probability > 0.5 → suggest rebooking
-        2. Otherwise → suggest best experience
-        3. Give clear action
+TASK:
+1. If delay_probability > 0.5 suggest rebooking.
+2. Otherwise suggest the best experience.
+3. Give one clear action.
 
-        Respond ONLY in JSON:
-        {{
-            "decision": "...",
-            "reason": "...",
-            "action": "...",
-            "rebooking_required": true/false
-        }}
-        """
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a smart travel decision-making AI agent."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        )
-
-        raw_output = response.choices[0].message.content.strip()
-
-        # 🔥 JSON PARSING (PRODUCTION SAFE)
+Respond ONLY in JSON:
+{{
+  "decision": "...",
+  "reason": "...",
+  "action": "...",
+  "rebooking_required": true
+}}
+"""
         try:
-            parsed_output = json.loads(raw_output)
-
-        except json.JSONDecodeError:
-            # Handle cases like ```json ... ```
-            cleaned = raw_output.replace("```json", "").replace("```", "").strip()
-
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a smart travel decision-making AI agent."},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            raw_output = (response.choices[0].message.content or "").strip()
             try:
+                parsed_output = json.loads(raw_output)
+            except json.JSONDecodeError:
+                cleaned = raw_output.replace("```json", "").replace("```", "").strip()
                 parsed_output = json.loads(cleaned)
-            except:
-                # अंतिम fallback (never crash system)
-                parsed_output = {
-                    "decision": "Unable to parse decision",
-                    "reason": raw_output,
-                    "action": "Retry or check system logs"
-                }
 
-        # If Groq parsing fails, return heuristic (never crash the pipeline).
-        if isinstance(parsed_output, dict) and "decision" in parsed_output:
-            return parsed_output
-        return heuristic
+            if isinstance(parsed_output, dict) and "decision" in parsed_output:
+                return parsed_output
+            return heuristic
+        except Exception:
+            return heuristic

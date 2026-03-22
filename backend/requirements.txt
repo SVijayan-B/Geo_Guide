@@ -8,3 +8,12 @@ bcrypt
 chromadb
 sentence-transformers
 scikit-learn
+langgraph
+groq
+requests
+httpx
+redis
+celery
+prometheus-client
+transformers
+ultralytics
